@@ -1,28 +1,39 @@
 package agent
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
-	"github.com/erikdubbelboer/gspt"
+	"github.com/gorilla/mux"
 	"github.com/k3s-io/k3s/pkg/agent"
+	"github.com/k3s-io/k3s/pkg/agent/https"
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
+	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/datadir"
+	k3smetrics "github.com/k3s-io/k3s/pkg/metrics"
+	"github.com/k3s-io/k3s/pkg/proctitle"
+	"github.com/k3s-io/k3s/pkg/profile"
+	"github.com/k3s-io/k3s/pkg/spegel"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/util/permissions"
 	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/k3s-io/k3s/pkg/vpn"
-	"github.com/rancher/wrangler/pkg/signals"
+	pkgerrors "github.com/pkg/errors"
+	"github.com/rancher/wrangler/v3/pkg/signals"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli"
 )
 
 func Run(ctx *cli.Context) error {
+	// Validate build env
+	cmds.MustValidateGolang()
+
 	// hide process arguments from ps output, since they may contain
 	// database credentials or other secrets.
-	gspt.SetProcTitle(os.Args[0] + " agent")
+	proctitle.SetProcTitle(os.Args[0] + " agent")
 
 	// Evacuate cgroup v2 before doing anything else that may fork.
 	if err := cmds.EvacuateCgroup2(); err != nil {
@@ -35,8 +46,10 @@ func Run(ctx *cli.Context) error {
 		return err
 	}
 
-	if runtime.GOOS != "windows" && os.Getuid() != 0 && !cmds.AgentConfig.Rootless {
-		return fmt.Errorf("agent must be run as root, or with --rootless")
+	if !cmds.AgentConfig.Rootless {
+		if err := permissions.IsPrivileged(); err != nil {
+			return pkgerrors.WithMessage(err, "agent requires additional privilege if not run with --rootless")
+		}
 	}
 
 	if cmds.AgentConfig.TokenFile != "" {
@@ -60,7 +73,11 @@ func Run(ctx *cli.Context) error {
 	}
 
 	if cmds.AgentConfig.FlannelIface != "" && len(cmds.AgentConfig.NodeIP) == 0 {
-		cmds.AgentConfig.NodeIP.Set(util.GetIPFromInterface(cmds.AgentConfig.FlannelIface))
+		ip, err := util.GetIPFromInterface(cmds.AgentConfig.FlannelIface)
+		if err != nil {
+			return err
+		}
+		cmds.AgentConfig.NodeIP.Set(ip)
 	}
 
 	logrus.Info("Starting " + version.Program + " agent " + ctx.App.Version)
@@ -77,19 +94,40 @@ func Run(ctx *cli.Context) error {
 	contextCtx := signals.SetupSignalContext()
 
 	go cmds.WriteCoverage(contextCtx)
-	if cmds.AgentConfig.VPNAuthFile != "" {
-		cmds.AgentConfig.VPNAuth, err = util.ReadFile(cmds.AgentConfig.VPNAuthFile)
+	if cfg.VPNAuthFile != "" {
+		cfg.VPNAuth, err = util.ReadFile(cfg.VPNAuthFile)
 		if err != nil {
 			return err
 		}
 	}
 
 	// Starts the VPN in the agent if config was set up
-	if cmds.AgentConfig.VPNAuth != "" {
-		err := vpn.StartVPN(cmds.AgentConfig.VPNAuth)
+	if cfg.VPNAuth != "" {
+		err := vpn.StartVPN(cfg.VPNAuth)
 		if err != nil {
 			return err
 		}
+	}
+
+	// Until the agent is run and retrieves config from the server, we won't know
+	// if the embedded registry is enabled. If it is not enabled, these are not
+	// used as the registry is never started.
+	registry := spegel.DefaultRegistry
+	registry.Bootstrapper = spegel.NewAgentBootstrapper(cfg.ServerURL, cfg.Token, cfg.DataDir)
+	registry.Router = func(ctx context.Context, nodeConfig *config.Node) (*mux.Router, error) {
+		return https.Start(ctx, nodeConfig, nil)
+	}
+
+	// same deal for metrics - these are not used if the extra metrics listener is not enabled.
+	metrics := k3smetrics.DefaultMetrics
+	metrics.Router = func(ctx context.Context, nodeConfig *config.Node) (*mux.Router, error) {
+		return https.Start(ctx, nodeConfig, nil)
+	}
+
+	// and for pprof as well
+	pprof := profile.DefaultProfiler
+	pprof.Router = func(ctx context.Context, nodeConfig *config.Node) (*mux.Router, error) {
+		return https.Start(ctx, nodeConfig, nil)
 	}
 
 	return agent.Run(contextCtx, cfg)

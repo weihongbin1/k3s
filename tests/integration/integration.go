@@ -15,20 +15,20 @@ import (
 	"time"
 
 	"github.com/k3s-io/k3s/pkg/flock"
+	"github.com/k3s-io/k3s/tests"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
 // Compile-time variable
 var existingServer = "False"
 
 const lockFile = "/tmp/k3s-test.lock"
+const DefaultConfig = "/etc/rancher/k3s/k3s.yaml"
 
 type K3sServer struct {
 	cmd *exec.Cmd
@@ -55,7 +55,7 @@ func findK3sExecutable() string {
 		break
 	}
 	if i == 20 {
-		logrus.Fatal("Unable to find k3s executable")
+		logrus.Fatalf("Unable to find k3s executable in %s", k3sBin)
 	}
 	return k3sBin
 }
@@ -128,69 +128,8 @@ func K3sServerArgs() []string {
 	return args
 }
 
-// K3sDefaultDeployments checks if the default deployments for K3s are ready, otherwise returns an error
-func K3sDefaultDeployments() error {
-	return CheckDeployments([]string{"coredns", "local-path-provisioner", "metrics-server", "traefik"})
-}
-
-// CheckDeployments checks if the provided list of deployments are ready, otherwise returns an error
-func CheckDeployments(deployments []string) error {
-
-	deploymentSet := make(map[string]bool)
-	for _, d := range deployments {
-		deploymentSet[d] = false
-	}
-
-	client, err := k8sClient()
-	if err != nil {
-		return err
-	}
-	deploymentList, err := client.AppsV1().Deployments("").List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return err
-	}
-	for _, deployment := range deploymentList.Items {
-		if _, ok := deploymentSet[deployment.Name]; ok && deployment.Status.ReadyReplicas == deployment.Status.Replicas {
-			deploymentSet[deployment.Name] = true
-		}
-	}
-	for d, found := range deploymentSet {
-		if !found {
-			return fmt.Errorf("failed to deploy %s", d)
-		}
-	}
-
-	return nil
-}
-
-func ParsePods(namespace string, opts metav1.ListOptions) ([]corev1.Pod, error) {
-	clientSet, err := k8sClient()
-	if err != nil {
-		return nil, err
-	}
-	pods, err := clientSet.CoreV1().Pods(namespace).List(context.Background(), opts)
-	if err != nil {
-		return nil, err
-	}
-
-	return pods.Items, nil
-}
-
-func ParseNodes() ([]corev1.Node, error) {
-	clientSet, err := k8sClient()
-	if err != nil {
-		return nil, err
-	}
-	nodes, err := clientSet.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return nodes.Items, nil
-}
-
 func GetPod(namespace, name string) (*corev1.Pod, error) {
-	client, err := k8sClient()
+	client, err := tests.K8sClient(DefaultConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +137,7 @@ func GetPod(namespace, name string) (*corev1.Pod, error) {
 }
 
 func GetPersistentVolumeClaim(namespace, name string) (*corev1.PersistentVolumeClaim, error) {
-	client, err := k8sClient()
+	client, err := tests.K8sClient(DefaultConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -206,7 +145,7 @@ func GetPersistentVolumeClaim(namespace, name string) (*corev1.PersistentVolumeC
 }
 
 func GetPersistentVolume(name string) (*corev1.PersistentVolume, error) {
-	client, err := k8sClient()
+	client, err := tests.K8sClient(DefaultConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -254,6 +193,7 @@ func K3sStartServer(inputArgs ...string) (*K3sServer, error) {
 		return nil, err
 	}
 	cmd.Stderr = f
+	logrus.Info("Starting k3s server. Check k3log.txt for logs")
 	err = cmd.Start()
 	return &K3sServer{cmd, f}, err
 }
@@ -280,6 +220,9 @@ func K3sStopServer(server *K3sServer) error {
 // K3sKillServer terminates the running K3s server and its children.
 // Equivalent to k3s-killall.sh
 func K3sKillServer(server *K3sServer) error {
+	if server == nil {
+		return nil
+	}
 	if server.log != nil {
 		server.log.Close()
 		os.Remove(server.log.Name())
@@ -359,14 +302,36 @@ func K3sSaveLog(server *K3sServer, dump bool) error {
 	return nil
 }
 
+func GetEndpointsAddresses() (string, error) {
+	client, err := tests.K8sClient(DefaultConfig)
+	if err != nil {
+		return "", err
+	}
+
+	endpoints, err := client.CoreV1().Endpoints("default").Get(context.Background(), "kubernetes", metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+
+	var addresses []string
+	for _, subset := range endpoints.Subsets {
+		for _, address := range subset.Addresses {
+			addresses = append(addresses, address.IP)
+		}
+	}
+
+	return strings.Join(addresses, ","), nil
+}
+
 // RunCommand Runs command on the host
 func RunCommand(cmd string) (string, error) {
 	c := exec.Command("bash", "-c", cmd)
 	var out bytes.Buffer
 	c.Stdout = &out
+	c.Stderr = &out
 	err := c.Run()
 	if err != nil {
-		return "", fmt.Errorf("%s", err)
+		return out.String(), fmt.Errorf("%s", err)
 	}
 	return out.String(), nil
 }
@@ -397,14 +362,15 @@ func unmountFolder(folder string) error {
 	return nil
 }
 
-func k8sClient() (*kubernetes.Clientset, error) {
-	config, err := clientcmd.BuildConfigFromFlags("", "/etc/rancher/k3s/k3s.yaml")
+func ParsePodsInNS(namespace string) ([]corev1.Pod, error) {
+	clientSet, err := tests.K8sClient(DefaultConfig)
 	if err != nil {
 		return nil, err
 	}
-	clientSet, err := kubernetes.NewForConfig(config)
+	pods, err := clientSet.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return nil, err
 	}
-	return clientSet, nil
+
+	return pods.Items, nil
 }

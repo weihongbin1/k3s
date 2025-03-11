@@ -2,15 +2,20 @@ package flannel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 
-	"github.com/k3s-io/k3s/pkg/agent/util"
+	agentutil "github.com/k3s-io/k3s/pkg/agent/util"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
-	"github.com/pkg/errors"
+	"github.com/k3s-io/k3s/pkg/util"
+	pkgerrors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	authorizationv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -23,34 +28,6 @@ import (
 )
 
 const (
-	cniConf = `{
-  "name":"cbr0",
-  "cniVersion":"1.0.0",
-  "plugins":[
-    {
-      "type":"flannel",
-      "delegate":{
-        "hairpinMode":true,
-        "forceAddress":true,
-        "isDefaultGateway":true
-      }
-    },
-    {
-      "type":"portmap",
-      "capabilities":{
-        "portMappings":true
-      }
-    },
-    {
-      "type":"bandwidth",
-      "capabilities":{
-        "bandwidth":true
-      }
-    }
-  ]
-}
-`
-
 	flannelConf = `{
 	"Network": "%CIDR%",
 	"EnableIPv6": %IPV6_ENABLED%,
@@ -59,10 +36,6 @@ const (
 	"Backend": %backend%
 }
 `
-
-	vxlanBackend = `{
-	"Type": "vxlan"
-}`
 
 	hostGWBackend = `{
 	"Type": "host-gw"
@@ -76,8 +49,7 @@ const (
 
 	wireguardNativeBackend = `{
 	"Type": "wireguard",
-	"PersistentKeepaliveInterval": %PersistentKeepaliveInterval%,
-	"Mode": "%Mode%"
+	"PersistentKeepaliveInterval": 25
 }`
 
 	emptyIPv6Network = "::/0"
@@ -94,21 +66,43 @@ func Prepare(ctx context.Context, nodeConfig *config.Node) error {
 	return createFlannelConf(nodeConfig)
 }
 
-func Run(ctx context.Context, nodeConfig *config.Node, nodes typedcorev1.NodeInterface) error {
+func Run(ctx context.Context, nodeConfig *config.Node) error {
 	logrus.Infof("Starting flannel with backend %s", nodeConfig.FlannelBackend)
-	if err := waitForPodCIDR(ctx, nodeConfig.AgentConfig.NodeName, nodes); err != nil {
-		return errors.Wrap(err, "flannel failed to wait for PodCIDR assignment")
+
+	kubeConfig := nodeConfig.AgentConfig.KubeConfigKubelet
+	resourceAttrs := authorizationv1.ResourceAttributes{Verb: "list", Resource: "nodes"}
+
+	// Compatibility code for AuthorizeNodeWithSelectors feature-gate.
+	// If the kubelet cannot list nodes, then wait for the k3s-controller RBAC to become ready, and use that kubeconfig instead.
+	if canListNodes, err := util.CheckRBAC(ctx, kubeConfig, resourceAttrs, ""); err != nil {
+		return pkgerrors.WithMessage(err, "failed to check if RBAC allows node list")
+	} else if !canListNodes {
+		kubeConfig = nodeConfig.AgentConfig.KubeConfigK3sController
+		if err := util.WaitForRBACReady(ctx, kubeConfig, util.DefaultAPIServerReadyTimeout, resourceAttrs, ""); err != nil {
+			return pkgerrors.WithMessage(err, "flannel failed to wait for RBAC")
+		}
+	}
+
+	coreClient, err := util.GetClientSet(kubeConfig)
+	if err != nil {
+		return err
+	}
+
+	if err := waitForPodCIDR(ctx, nodeConfig.AgentConfig.NodeName, coreClient.CoreV1().Nodes()); err != nil {
+		return pkgerrors.WithMessage(err, "flannel failed to wait for PodCIDR assignment")
 	}
 
 	netMode, err := findNetMode(nodeConfig.AgentConfig.ClusterCIDRs)
 	if err != nil {
-		return errors.Wrap(err, "failed to check netMode for flannel")
+		return pkgerrors.WithMessage(err, "failed to check netMode for flannel")
 	}
 	go func() {
-		err := flannel(ctx, nodeConfig.FlannelIface, nodeConfig.FlannelConfFile, nodeConfig.AgentConfig.KubeConfigKubelet, nodeConfig.FlannelIPv6Masq, nodeConfig.MultiClusterCIDR, netMode)
+		err := flannel(ctx, nodeConfig.FlannelIface, nodeConfig.FlannelConfFile, kubeConfig, nodeConfig.FlannelIPv6Masq, netMode)
 		if err != nil && !errors.Is(err, context.Canceled) {
-			logrus.Fatalf("flannel exited: %v", err)
+			logrus.Errorf("flannel exited: %v", err)
+			os.Exit(1)
 		}
+		os.Exit(0)
 	}()
 
 	return nil
@@ -135,7 +129,7 @@ func waitForPodCIDR(ctx context.Context, nodeName string, nodes typedcorev1.Node
 	}
 
 	if _, err := toolswatch.UntilWithSync(ctx, lw, &v1.Node{}, nil, condition); err != nil {
-		return errors.Wrap(err, "failed to wait for PodCIDR assignment")
+		return pkgerrors.WithMessage(err, "failed to wait for PodCIDR assignment")
 	}
 
 	logrus.Info("Flannel found PodCIDR assigned for node " + nodeName)
@@ -151,9 +145,22 @@ func createCNIConf(dir string, nodeConfig *config.Node) error {
 
 	if nodeConfig.AgentConfig.FlannelCniConfFile != "" {
 		logrus.Debugf("Using %s as the flannel CNI conf", nodeConfig.AgentConfig.FlannelCniConfFile)
-		return util.CopyFile(nodeConfig.AgentConfig.FlannelCniConfFile, p, false)
+		return agentutil.CopyFile(nodeConfig.AgentConfig.FlannelCniConfFile, p, false)
 	}
-	return util.WriteFile(p, cniConf)
+
+	cniConfJSON := cniConf
+	if goruntime.GOOS == "windows" {
+		extIface, err := LookupExtInterface(nodeConfig.FlannelIface, ipv4)
+		if err != nil {
+			return err
+		}
+
+		cniConfJSON = strings.ReplaceAll(cniConfJSON, "%IPV4_ADDRESS%", extIface.IfaceAddr.String())
+		cniConfJSON = strings.ReplaceAll(cniConfJSON, "%CLUSTER_CIDR%", nodeConfig.AgentConfig.ClusterCIDR.String())
+		cniConfJSON = strings.ReplaceAll(cniConfJSON, "%SERVICE_CIDR%", nodeConfig.AgentConfig.ServiceCIDR.String())
+	}
+
+	return agentutil.WriteFile(p, cniConfJSON)
 }
 
 func createFlannelConf(nodeConfig *config.Node) error {
@@ -182,12 +189,13 @@ func createFlannelConf(nodeConfig *config.Node) error {
 		confJSON = strings.ReplaceAll(confJSON, "%IPV6_ENABLED%", "false")
 		confJSON = strings.ReplaceAll(confJSON, "%CIDR_IPV6%", emptyIPv6Network)
 	} else if netMode == (ipv4 + ipv6) {
-		confJSON = strings.ReplaceAll(confJSON, "%CIDR%", nodeConfig.AgentConfig.ClusterCIDR.String())
 		confJSON = strings.ReplaceAll(confJSON, "%IPV6_ENABLED%", "true")
 		for _, cidr := range nodeConfig.AgentConfig.ClusterCIDRs {
 			if utilsnet.IsIPv6(cidr.IP) {
 				// Only one ipv6 range available. This might change in future: https://github.com/kubernetes/enhancements/issues/2593
 				confJSON = strings.ReplaceAll(confJSON, "%CIDR_IPV6%", cidr.String())
+			} else {
+				confJSON = strings.ReplaceAll(confJSON, "%CIDR%", cidr.String())
 			}
 		}
 	} else {
@@ -202,7 +210,16 @@ func createFlannelConf(nodeConfig *config.Node) error {
 	}
 
 	var backendConf string
-	backendOptions := make(map[string]string)
+
+	// precheck and error out unsupported flannel backends.
+	switch nodeConfig.FlannelBackend {
+	case config.FlannelBackendHostGW:
+	case config.FlannelBackendTailscale:
+	case config.FlannelBackendWireguardNative:
+		if goruntime.GOOS == "windows" {
+			return fmt.Errorf("unsupported flannel backend '%s' for Windows", nodeConfig.FlannelBackend)
+		}
+	}
 
 	switch nodeConfig.FlannelBackend {
 	case config.FlannelBackendVXLAN:
@@ -223,23 +240,14 @@ func createFlannelConf(nodeConfig *config.Node) error {
 		}
 		backendConf = strings.ReplaceAll(tailscaledBackend, "%Routes%", routes)
 	case config.FlannelBackendWireguardNative:
-		mode, ok := backendOptions["Mode"]
-		if !ok {
-			mode = "separate"
-		}
-		keepalive, ok := backendOptions["PersistentKeepaliveInterval"]
-		if !ok {
-			keepalive = "25"
-		}
-		backendConf = strings.ReplaceAll(wireguardNativeBackend, "%Mode%", mode)
-		backendConf = strings.ReplaceAll(backendConf, "%PersistentKeepaliveInterval%", keepalive)
+		backendConf = wireguardNativeBackend
 	default:
 		return fmt.Errorf("Cannot configure unknown flannel backend '%s'", nodeConfig.FlannelBackend)
 	}
 	confJSON = strings.ReplaceAll(confJSON, "%backend%", backendConf)
 
 	logrus.Debugf("The flannel configuration is %s", confJSON)
-	return util.WriteFile(nodeConfig.FlannelConfFile, confJSON)
+	return agentutil.WriteFile(nodeConfig.FlannelConfFile, confJSON)
 }
 
 // fundNetMode returns the mode (ipv4, ipv6 or dual-stack) in which flannel is operating

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	tests "github.com/k3s-io/k3s/tests"
 	testutil "github.com/k3s-io/k3s/tests/integration"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -40,7 +41,7 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 	When("a new etcd is created", func() {
 		It("starts up with no problems", func() {
 			Eventually(func() error {
-				return testutil.K3sDefaultDeployments()
+				return tests.CheckDefaultDeployments(testutil.DefaultConfig)
 			}, "180s", "10s").Should(Succeed())
 		})
 		It("saves an etcd snapshot", func() {
@@ -54,26 +55,26 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 		It("deletes a snapshot", func() {
 			lsResult, err := testutil.K3sCmd("etcd-snapshot", "ls")
 			Expect(err).ToNot(HaveOccurred())
-			reg, err := regexp.Compile(`on-demand[^\s]+`)
+			reg, err := regexp.Compile(`(?m)^on-demand[^\s]+`)
 			Expect(err).ToNot(HaveOccurred())
 			snapshotName := reg.FindString(lsResult)
 			Expect(testutil.K3sCmd("etcd-snapshot", "delete", snapshotName)).
-				To(ContainSubstring("Removing the given locally stored etcd snapshot"))
+				To(ContainSubstring("Snapshot " + snapshotName + " deleted"))
 		})
 	})
 	When("saving a custom name", func() {
 		It("saves an etcd snapshot with a custom name", func() {
 			Expect(testutil.K3sCmd("etcd-snapshot", "save --name ALIVEBEEF")).
-				To(ContainSubstring("Saving etcd snapshot to /var/lib/rancher/k3s/server/db/snapshots/ALIVEBEEF"))
+				To(ContainSubstring("Snapshot ALIVEBEEF-"))
 		})
 		It("deletes that snapshot", func() {
 			lsResult, err := testutil.K3sCmd("etcd-snapshot", "ls")
 			Expect(err).ToNot(HaveOccurred())
-			reg, err := regexp.Compile(`ALIVEBEEF[^\s]+`)
+			reg, err := regexp.Compile(`(?m)^ALIVEBEEF[^\s]+`)
 			Expect(err).ToNot(HaveOccurred())
 			snapshotName := reg.FindString(lsResult)
 			Expect(testutil.K3sCmd("etcd-snapshot", "delete", snapshotName)).
-				To(ContainSubstring("Removing the given locally stored etcd snapshot"))
+				To(ContainSubstring("Snapshot " + snapshotName + " deleted"))
 		})
 	})
 	When("using etcd snapshot prune", func() {
@@ -91,17 +92,17 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 		It("lists all 3 snapshots", func() {
 			lsResult, err := testutil.K3sCmd("etcd-snapshot", "ls")
 			Expect(err).ToNot(HaveOccurred())
-			reg, err := regexp.Compile(`:///var/lib/rancher/k3s/server/db/snapshots/PRUNE_TEST`)
+			reg, err := regexp.Compile(`(?m):///var/lib/rancher/k3s/server/db/snapshots/PRUNE_TEST`)
 			Expect(err).ToNot(HaveOccurred())
 			sepLines := reg.FindAllString(lsResult, -1)
 			Expect(sepLines).To(HaveLen(3))
 		})
 		It("prunes snapshots down to 2", func() {
 			Expect(testutil.K3sCmd("etcd-snapshot", "prune --snapshot-retention 2 --name PRUNE_TEST")).
-				To(ContainSubstring("Removing local snapshot"))
+				To(ContainSubstring(" deleted."))
 			lsResult, err := testutil.K3sCmd("etcd-snapshot", "ls")
 			Expect(err).ToNot(HaveOccurred())
-			reg, err := regexp.Compile(`:///var/lib/rancher/k3s/server/db/snapshots/PRUNE_TEST`)
+			reg, err := regexp.Compile(`(?m):///var/lib/rancher/k3s/server/db/snapshots/PRUNE_TEST`)
 			Expect(err).ToNot(HaveOccurred())
 			sepLines := reg.FindAllString(lsResult, -1)
 			Expect(sepLines).To(HaveLen(2))
@@ -109,11 +110,11 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 		It("cleans up remaining snapshots", func() {
 			lsResult, err := testutil.K3sCmd("etcd-snapshot", "ls")
 			Expect(err).ToNot(HaveOccurred())
-			reg, err := regexp.Compile(`PRUNE_TEST[^\s]+`)
+			reg, err := regexp.Compile(`(?m)^PRUNE_TEST[^\s]+`)
 			Expect(err).ToNot(HaveOccurred())
 			for _, snapshotName := range reg.FindAllString(lsResult, -1) {
 				Expect(testutil.K3sCmd("etcd-snapshot", "delete", snapshotName)).
-					To(ContainSubstring("Removing the given locally stored etcd snapshot"))
+					To(ContainSubstring("Snapshot " + snapshotName + " deleted"))
 			}
 		})
 	})
@@ -130,7 +131,7 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 			server, err = testutil.K3sStartServer(localServerArgs...)
 			Expect(err).ToNot(HaveOccurred())
 			Eventually(func() error {
-				return testutil.K3sDefaultDeployments()
+				return tests.CheckDefaultDeployments(testutil.DefaultConfig)
 			}, "180s", "5s").Should(Succeed())
 
 		})
@@ -156,7 +157,7 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 			server, err = testutil.K3sStartServer(localServerArgs...)
 			Expect(err).ToNot(HaveOccurred())
 			Eventually(func() error {
-				return testutil.K3sDefaultDeployments()
+				return tests.CheckDefaultDeployments(testutil.DefaultConfig)
 			}, "180s", "5s").Should(Succeed())
 
 		})

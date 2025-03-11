@@ -44,6 +44,10 @@ set -o noglob
 #     Commit of k3s to download from temporary cloud storage.
 #     * (for developer & QA use)
 #
+#   - INSTALL_K3S_PR
+#     PR build of k3s to download from Github Artifacts.
+#     * (for developer & QA use)
+#
 #   - INSTALL_K3S_BIN_DIR
 #     Directory to install k3s binary, links, and uninstall script to, or use
 #     /usr/local/bin as the default
@@ -91,7 +95,8 @@ set -o noglob
 #     Channel to use for fetching k3s download URL.
 #     Defaults to 'stable'.
 
-GITHUB_URL=https://github.com/k3s-io/k3s/releases
+GITHUB_URL=${GITHUB_URL:-https://github.com/k3s-io/k3s/releases}
+GITHUB_PR_URL=""
 STORAGE_URL=https://k3s-ci-builds.s3.amazonaws.com
 DOWNLOADER=
 
@@ -275,11 +280,11 @@ can_skip_download_binary() {
     fi
 }
 
-can_skip_download_selinux() {                                                        
-    if [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != true ] && [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != selinux ]; then 
-        return 1                                                                     
-    fi                                                                               
-}  
+can_skip_download_selinux() {
+    if [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != true ] && [ "${INSTALL_K3S_SKIP_DOWNLOAD}" != selinux ]; then
+        return 1
+    fi
+}
 
 # --- verify an executable k3s binary is installed ---
 verify_k3s_is_executable() {
@@ -337,6 +342,7 @@ verify_downloader() {
 setup_tmp() {
     TMP_DIR=$(mktemp -d -t k3s-install.XXXXXXXXXX)
     TMP_HASH=${TMP_DIR}/k3s.hash
+    TMP_ZIP=${TMP_DIR}/k3s.zip
     TMP_BIN=${TMP_DIR}/k3s.bin
     cleanup() {
         code=$?
@@ -350,7 +356,10 @@ setup_tmp() {
 
 # --- use desired k3s version if defined or find version from channel ---
 get_release_version() {
-    if [ -n "${INSTALL_K3S_COMMIT}" ]; then
+    if [ -n "${INSTALL_K3S_PR}" ]; then
+        VERSION_K3S="PR ${INSTALL_K3S_PR}"
+        get_pr_artifact_url
+    elif [ -n "${INSTALL_K3S_COMMIT}" ]; then
         VERSION_K3S="commit ${INSTALL_K3S_COMMIT}"
     elif [ -n "${INSTALL_K3S_VERSION}" ]; then
         VERSION_K3S=${INSTALL_K3S_VERSION}
@@ -376,7 +385,7 @@ get_release_version() {
 get_k3s_selinux_version() {
     available_version="k3s-selinux-1.2-2.${rpm_target}.noarch.rpm"
     info "Finding available k3s-selinux versions"
-    
+
     # run verify_downloader in case it binary installation was skipped
     verify_downloader curl || verify_downloader wget || fatal 'Can not find curl or wget for downloading files'
 
@@ -415,31 +424,50 @@ get_k3s_selinux_version() {
 download() {
     [ $# -eq 2 ] || fatal 'download needs exactly 2 arguments'
 
+    # Disable exit-on-error so we can do custom error messages on failure
+    set +e
+
+    # Default to a failure status
+    status=1
+
     case $DOWNLOADER in
         curl)
             curl -o $1 -sfL $2
+            status=$?
             ;;
         wget)
             wget -qO $1 $2
+            status=$?
             ;;
         *)
+	    # Enable exit-on-error for fatal to execute
+	    set -e
             fatal "Incorrect executable '$DOWNLOADER'"
             ;;
     esac
 
+    # Re-enable exit-on-error
+    set -e
+
     # Abort if download command failed
-    [ $? -eq 0 ] || fatal 'Download failed'
+    [ $status -eq 0 ] || fatal 'Download failed'
 }
 
 # --- download hash from github url ---
 download_hash() {
-    if [ -n "${INSTALL_K3S_COMMIT}" ]; then
-        HASH_URL=${STORAGE_URL}/k3s${SUFFIX}-${INSTALL_K3S_COMMIT}.sha256sum
+    if [ -n "${INSTALL_K3S_PR}" ]; then
+        info "Downloading hash ${GITHUB_PR_URL}"
+        curl -s -o ${TMP_ZIP} -H "Authorization: Bearer $GITHUB_TOKEN" -L ${GITHUB_PR_URL}
+        unzip -p ${TMP_ZIP} k3s.sha256sum > ${TMP_HASH}
     else
-        HASH_URL=${GITHUB_URL}/download/${VERSION_K3S}/sha256sum-${ARCH}.txt
+        if [ -n "${INSTALL_K3S_COMMIT}" ]; then
+            HASH_URL=${STORAGE_URL}/k3s${SUFFIX}-${INSTALL_K3S_COMMIT}.sha256sum
+        else
+            HASH_URL=${GITHUB_URL}/download/${VERSION_K3S}/sha256sum-${ARCH}.txt
+        fi
+        info "Downloading hash ${HASH_URL}"
+        download ${TMP_HASH} ${HASH_URL}
     fi
-    info "Downloading hash ${HASH_URL}"
-    download ${TMP_HASH} ${HASH_URL}
     HASH_EXPECTED=$(grep " k3s${SUFFIX}$" ${TMP_HASH})
     HASH_EXPECTED=${HASH_EXPECTED%%[[:blank:]]*}
 }
@@ -456,9 +484,52 @@ installed_hash_matches() {
     return 1
 }
 
+# Use the GitHub API to identify the artifact associated with a given PR
+get_pr_artifact_url() {
+    github_api_url=https://api.github.com/repos/k3s-io/k3s
+
+    # Check if jq is installed
+    if ! [ -x "$(command -v jq)" ]; then
+        fatal "Installing PR builds requires jq"
+    fi
+
+    # Check if unzip is installed
+    if ! [ -x "$(command -v unzip)" ]; then
+        fatal "Installing PR builds requires unzip"
+    fi
+
+    if [ -z "${GITHUB_TOKEN}" ]; then
+        fatal "Installing PR builds requires GITHUB_TOKEN with k3s-io/k3s repo permissions"
+    fi
+
+    # GET request to the GitHub API to retrieve the latest commit SHA from the pull request
+    set +e
+    commit_id=$(curl -f -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "${github_api_url}/pulls/${INSTALL_K3S_PR}" | jq -r '.head.sha')
+    set -e
+
+    if [ -z "${commit_id}" ]; then
+        fatal "Installing PR builds requires GITHUB_TOKEN with k3s-io/k3s repo permissions"
+    fi
+
+    # GET request to the GitHub API to retrieve the Build workflow associated with the commit
+    run_id=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "${github_api_url}/commits/${commit_id}/check-runs?check_name=build%20%2F%20Build" | jq -r '[.check_runs | sort_by(.id) | .[].details_url | split("/")[7]] | last')
+
+    # Extract the artifact ID for the "k3s" artifact
+    GITHUB_PR_URL=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" "${github_api_url}/actions/runs/${run_id}/artifacts" | jq -r '.artifacts[] | select(.name == "k3s") | .archive_download_url')
+}
+
 # --- download binary from github url ---
 download_binary() {
-    if [ -n "${INSTALL_K3S_COMMIT}" ]; then
+    if [ -n "${INSTALL_K3S_PR}" ]; then
+        # Since Binary and Hash are zipped together, check if TMP_ZIP already exists
+        if ! [ -f ${TMP_ZIP} ]; then
+            info "Downloading K3s artifact ${GITHUB_PR_URL}"
+            curl -s -f -o ${TMP_ZIP} -H "Authorization: Bearer $GITHUB_TOKEN" -L ${GITHUB_PR_URL}
+        fi
+        # extract k3s binary from zip
+        unzip -p ${TMP_ZIP} k3s > ${TMP_BIN}
+        return
+    elif [ -n "${INSTALL_K3S_COMMIT}" ]; then
         BIN_URL=${STORAGE_URL}/k3s${SUFFIX}-${INSTALL_K3S_COMMIT}
     else
         BIN_URL=${GITHUB_URL}/download/${VERSION_K3S}/k3s${SUFFIX}
@@ -487,7 +558,7 @@ setup_binary() {
 
 # --- setup selinux policy ---
 setup_selinux() {
-    case ${INSTALL_K3S_CHANNEL} in 
+    case ${INSTALL_K3S_CHANNEL} in
         *testing)
             rpm_channel=testing
             ;;
@@ -509,20 +580,21 @@ setup_selinux() {
         rpm_target=sle
         rpm_site_infix=microos
         package_installer=zypper
-        if [ "${ID_LIKE:-}" = suse ] && [ "${VARIANT_ID:-}" = sle-micro ]; then
+        if [ "${ID_LIKE:-}" = suse ] && ( [ "${VARIANT_ID:-}" = sle-micro ] || [ "${ID:-}" = sle-micro ] ); then
             rpm_target=sle
             rpm_site_infix=slemicro
             package_installer=zypper
         fi
-    elif [ "${ID_LIKE:-}" = coreos ] || [ "${VARIANT_ID:-}" = coreos ]; then
+    elif [ "${ID_LIKE:-}" = coreos ] || [ "${VARIANT_ID:-}" = coreos ] || [ "${VARIANT_ID:-}" = "iot" ] || \
+         { { [ "${ID:-}" = fedora ] || [ "${ID_LIKE:-}" = fedora ]; } && [ -n "${OSTREE_VERSION:-}" ]; }; then
         rpm_target=coreos
         rpm_site_infix=coreos
         package_installer=rpm-ostree
-    elif [ "${VERSION_ID%%.*}" = "7" ]; then
+    elif [ "${VERSION_ID%%.*}" = "7" ] || ( [ "${ID:-}" = amzn ] && [ "${VERSION_ID%%.*}" = "2" ] ); then
         rpm_target=el7
         rpm_site_infix=centos/7
         package_installer=yum
-    elif [ "${VERSION_ID%%.*}" = "8" ] || [ "${VERSION_ID%%.*}" -gt "36" ]; then
+    elif [ "${VERSION_ID%%.*}" = "8" ] || [ "${VERSION_ID%%.*}" = "V10" ] || [ "${VERSION_ID%%.*}" -gt "36" ]; then
         rpm_target=el8
         rpm_site_infix=centos/8
         package_installer=yum
@@ -547,13 +619,15 @@ setup_selinux() {
 
     if [ "$INSTALL_K3S_SKIP_SELINUX_RPM" = true ] || can_skip_download_selinux || [ ! -d /usr/share/selinux ]; then
         info "Skipping installation of SELinux RPM"
-    else
-        get_k3s_selinux_version
-        install_selinux_rpm ${rpm_site} ${rpm_channel} ${rpm_target} ${rpm_site_infix}
+        return
     fi
 
+    get_k3s_selinux_version
+    install_selinux_rpm ${rpm_site} ${rpm_channel} ${rpm_target} ${rpm_site_infix}
+
     policy_error=fatal
-    if [ "$INSTALL_K3S_SELINUX_WARN" = true ] || [ "${ID_LIKE:-}" = coreos ] || [ "${VARIANT_ID:-}" = coreos ]; then
+    if [ "$INSTALL_K3S_SELINUX_WARN" = true ] || [ "${ID_LIKE:-}" = coreos ] ||
+       [ "${VARIANT_ID:-}" = coreos ] || [ "${VARIANT_ID:-}" = iot ]; then
         policy_error=warn
     fi
 
@@ -562,7 +636,8 @@ setup_selinux() {
             $policy_error "Failed to apply container_runtime_exec_t to ${BIN_DIR}/k3s, ${policy_hint}"
         fi
     elif [ ! -f /usr/share/selinux/packages/k3s.pp ]; then
-        if [ -x /usr/sbin/transactional-update ] || [ "${ID_LIKE:-}" = coreos ] || [ "${VARIANT_ID:-}" = coreos ]; then
+        if [ -x /usr/sbin/transactional-update ] || [ "${ID_LIKE:-}" = coreos ] || \
+            { { [ "${ID:-}" = fedora ] || [ "${ID_LIKE:-}" = fedora ]; } && [ -n "${OSTREE_VERSION:-}" ]; }; then
             warn "Please reboot your machine to activate the changes and avoid data loss."
         else
             $policy_error "Failed to find the k3s-selinux policy, ${policy_hint}"
@@ -571,7 +646,8 @@ setup_selinux() {
 }
 
 install_selinux_rpm() {
-    if [ -r /etc/redhat-release ] || [ -r /etc/centos-release ] || [ -r /etc/oracle-release ] || [ -r /etc/fedora-release ] || [ "${ID_LIKE%%[ ]*}" = "suse" ]; then
+    if [ -r /etc/redhat-release ] || [ -r /etc/centos-release ] || [ -r /etc/oracle-release ] ||
+       [ -r /etc/fedora-release ] || [ -r /etc/system-release ] || [ "${ID_LIKE%%[ ]*}" = "suse" ]; then
         repodir=/etc/yum.repos.d
         if [ -d /etc/zypp/repos.d ]; then
             repodir=/etc/zypp/repos.d
@@ -601,7 +677,7 @@ EOF
                 : "${INSTALL_K3S_SKIP_START:=true}"
             fi
             # create the /var/lib/rpm-state in SLE systems to fix the prein selinux macro
-            ${transactional_update_run} mkdir -p /var/lib/rpm-state
+            $SUDO ${transactional_update_run} mkdir -p /var/lib/rpm-state
             ;;
         coreos)
             rpm_installer="rpm-ostree --idempotent"
@@ -615,7 +691,7 @@ EOF
         if [ "${rpm_installer}" = "yum" ] && [ -x /usr/bin/dnf ]; then
             rpm_installer=dnf
         fi
-	    if rpm -q --quiet k3s-selinux; then 
+	    if rpm -q --quiet k3s-selinux; then
             # remove k3s-selinux module before upgrade to allow container-selinux to upgrade safely
             if check_available_upgrades container-selinux ${3} && check_available_upgrades k3s-selinux ${3}; then
                 MODULE_PRIORITY=$($SUDO semodule --list=full | grep k3s | cut -f1 -d" ")
@@ -699,9 +775,11 @@ create_killall() {
     info "Creating killall script ${KILLALL_K3S_SH}"
     $SUDO tee ${KILLALL_K3S_SH} >/dev/null << \EOF
 #!/bin/sh
-[ $(id -u) -eq 0 ] || exec sudo $0 $@
+[ $(id -u) -eq 0 ] || exec sudo --preserve-env=K3S_DATA_DIR $0 $@
 
-for bin in /var/lib/rancher/k3s/data/**/bin/; do
+K3S_DATA_DIR=${K3S_DATA_DIR:-/var/lib/rancher/k3s}
+
+for bin in ${K3S_DATA_DIR}/data/**/bin/; do
     [ -d $bin ] && export PATH=$PATH:$bin:$bin/aux
 done
 
@@ -761,7 +839,7 @@ remove_interfaces() {
 }
 
 getshims() {
-    ps -e -o pid= -o args= | sed -e 's/^ *//; s/\s\s*/\t/;' | grep -w 'k3s/data/[^/]*/bin/containerd-shim' | cut -f1
+    ps -e -o pid= -o args= | sed -e 's/^ *//; s/\s\s*/\t/;' | grep -w "${K3S_DATA_DIR}"'/data/[^/]*/bin/containerd-shim' | cut -f1
 }
 
 killtree $({ set +x; } 2>/dev/null; getshims; set -x)
@@ -770,12 +848,11 @@ do_unmount_and_remove() {
     set +x
     while read -r _ path _; do
         case "$path" in $1*) echo "$path" ;; esac
-    done < /proc/self/mounts | sort -r | xargs -r -t -n 1 sh -c 'umount "$0" && rm -rf "$0"'
+    done < /proc/self/mounts | sort -r | xargs -r -t -n 1 sh -c 'umount -f "$0" && rm -rf "$0"'
     set -x
 }
 
 do_unmount_and_remove '/run/k3s'
-do_unmount_and_remove '/var/lib/rancher/k3s'
 do_unmount_and_remove '/var/lib/kubelet/pods'
 do_unmount_and_remove '/var/lib/kubelet/plugins'
 do_unmount_and_remove '/run/netns/cni-'
@@ -800,7 +877,9 @@ create_uninstall() {
     $SUDO tee ${UNINSTALL_K3S_SH} >/dev/null << EOF
 #!/bin/sh
 set -x
-[ \$(id -u) -eq 0 ] || exec sudo \$0 \$@
+[ \$(id -u) -eq 0 ] || exec sudo --preserve-env=K3S_DATA_DIR \$0 \$@
+
+K3S_DATA_DIR=\${K3S_DATA_DIR:-/var/lib/rancher/k3s}
 
 ${KILLALL_K3S_SH}
 
@@ -832,10 +911,29 @@ for cmd in kubectl crictl ctr; do
     fi
 done
 
+clean_mounted_directory() {
+    if ! grep -q " \$1" /proc/mounts; then
+        rm -rf "\$1"
+	return 0
+    fi
+
+    for path in "\$1"/*; do
+        if [ -d "\$path" ]; then
+            if grep -q " \$path" /proc/mounts; then
+                clean_mounted_directory "\$path"
+            else
+                rm -rf "\$path"
+            fi
+        else
+            rm "\$path"
+        fi
+     done
+}
+
 rm -rf /etc/rancher/k3s
 rm -rf /run/k3s
 rm -rf /run/flannel
-rm -rf /var/lib/rancher/k3s
+clean_mounted_directory \${K3S_DATA_DIR}
 rm -rf /var/lib/kubelet
 rm -f ${BIN_DIR}/k3s
 rm -f ${KILLALL_K3S_SH}
@@ -851,7 +949,7 @@ elif type zypper >/dev/null 2>&1; then
     if [ "\${TRANSACTIONAL_UPDATE=false}" != "true" ] && [ -x /usr/sbin/transactional-update ]; then
         uninstall_cmd="transactional-update --no-selfupdate -d run \$uninstall_cmd"
     fi
-    \$uninstall_cmd
+    $SUDO \$uninstall_cmd
     rm -f /etc/zypp/repos.d/rancher-k3s-common*.repo
 fi
 EOF
@@ -895,6 +993,7 @@ EnvironmentFile=-/etc/sysconfig/%N
 EnvironmentFile=-${FILE_K3S_ENV}
 KillMode=process
 Delegate=yes
+User=root
 # Having non-zero Limit*s causes performance problems due to accounting overhead
 # in the kernel. We recommend using cgroups to do container-local accounting.
 LimitNOFILE=1048576
@@ -904,7 +1003,7 @@ TasksMax=infinity
 TimeoutStartSec=0
 Restart=always
 RestartSec=5s
-ExecStartPre=/bin/sh -xc '! /usr/bin/systemctl is-enabled --quiet nm-cloud-setup.service'
+ExecStartPre=/bin/sh -xc '! /usr/bin/systemctl is-enabled --quiet nm-cloud-setup.service 2>/dev/null'
 ExecStartPre=-/sbin/modprobe br_netfilter
 ExecStartPre=-/sbin/modprobe overlay
 ExecStart=${BIN_DIR}/k3s \\
@@ -961,9 +1060,14 @@ EOF
 
 # --- write systemd or openrc service file ---
 create_service_file() {
-    [ "${HAS_SYSTEMD}" = true ] && create_systemd_service_file
+    [ "${HAS_SYSTEMD}" = true ] && create_systemd_service_file && restore_systemd_service_file_context
     [ "${HAS_OPENRC}" = true ] && create_openrc_service_file
     return 0
+}
+
+restore_systemd_service_file_context() {
+    $SUDO restorecon -R -i ${FILE_K3S_SERVICE} 2>/dev/null || true
+    $SUDO restorecon -R -i ${FILE_K3S_ENV} 2>/dev/null || true
 }
 
 # --- get hashes of the current k3s bin and service files
@@ -994,10 +1098,22 @@ openrc_start() {
     $SUDO ${FILE_K3S_SERVICE} restart
 }
 
+has_working_xtables() {
+    if $SUDO sh -c "command -v \"$1-save\"" 1> /dev/null && $SUDO sh -c "command -v \"$1-restore\"" 1> /dev/null; then
+        if $SUDO $1-save 2>/dev/null | grep -q '^-A CNI-HOSTPORT-MASQ -j MASQUERADE$'; then
+            warn "Host $1-save/$1-restore tools are incompatible with existing rules"
+        else
+            return 0
+        fi
+    else
+        info "Host $1-save/$1-restore tools not found"
+    fi
+    return 1
+}
+
 # --- startup systemd or openrc service ---
 service_enable_and_start() {
-    if [ -f "/proc/cgroups" ] && [ "$(grep memory /proc/cgroups | while read -r n n n enabled; do echo $enabled; done)" -eq 0 ];
-    then
+    if ! grep -qs memory /sys/fs/cgroup/cgroup.controllers && ! [ "$(grep -s memory /proc/cgroups | while read -r n n n enabled; do echo $enabled; done)" = "1" ]; then
         info 'Failed to find memory cgroup, you may need to add "cgroup_memory=1 cgroup_enable=memory" to your linux cmdline (/boot/cmdline.txt on a Raspberry Pi)'
     fi
 
@@ -1014,14 +1130,11 @@ service_enable_and_start() {
         return
     fi
 
-    if command -v iptables-save 1> /dev/null && command -v iptables-restore 1> /dev/null
-    then
-	    $SUDO iptables-save | grep -v KUBE- | grep -iv flannel | $SUDO iptables-restore
-    fi
-    if command -v ip6tables-save 1> /dev/null && command -v ip6tables-restore 1> /dev/null
-    then
-	    $SUDO ip6tables-save | grep -v KUBE- | grep -iv flannel | $SUDO ip6tables-restore
-    fi
+    for XTABLES in iptables ip6tables; do
+        if has_working_xtables ${XTABLES}; then
+            $SUDO ${XTABLES}-save 2>/dev/null | grep -v KUBE- | grep -iv flannel | $SUDO ${XTABLES}-restore
+        fi
+    done
 
     [ "${HAS_SYSTEMD}" = true ] && systemd_start
     [ "${HAS_OPENRC}" = true ] && openrc_start

@@ -4,28 +4,25 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/http/pprof"
 	"os"
 	"path/filepath"
+	"strconv"
 
-	"github.com/gorilla/mux"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
-	"github.com/k3s-io/k3s/pkg/etcd"
+	"github.com/k3s-io/k3s/pkg/util"
 	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/rancher/dynamiclistener"
 	"github.com/rancher/dynamiclistener/factory"
 	"github.com/rancher/dynamiclistener/storage/file"
 	"github.com/rancher/dynamiclistener/storage/kubernetes"
 	"github.com/rancher/dynamiclistener/storage/memory"
-	"github.com/rancher/wrangler/pkg/generated/controllers/core"
+	"github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
 	"github.com/sirupsen/logrus"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilsnet "k8s.io/utils/net"
 )
 
 // newListener returns a new TCP listener and HTTP request handler using dynamiclistener.
@@ -33,17 +30,18 @@ import (
 // and will sync the certs into the Kubernetes datastore, with a local disk cache.
 func (c *Cluster) newListener(ctx context.Context) (net.Listener, http.Handler, error) {
 	if c.managedDB != nil {
-		if _, err := os.Stat(etcd.ResetFile(c.config)); err == nil {
-			// delete the dynamic listener file if it exists after restoration to fix restoration
-			// on fresh nodes
+		resetDone, err := c.managedDB.IsReset()
+		if err != nil {
+			return nil, nil, err
+		}
+		if resetDone {
+			// delete the dynamic listener TLS secret cache after restoring,
+			// to ensure that dynamiclistener doesn't sync the old secret over the top
+			// of whatever was just restored.
 			os.Remove(filepath.Join(c.config.DataDir, "tls/dynamic-cert.json"))
 		}
 	}
-	ip := c.config.BindAddress
-	if utilsnet.IsIPv6String(ip) {
-		ip = fmt.Sprintf("[%s]", ip)
-	}
-	tcp, err := dynamiclistener.NewTCPListener(ip, c.config.SupervisorPort)
+	tcp, err := util.ListenWithLoopback(ctx, c.config.BindAddress, strconv.Itoa(c.config.SupervisorPort))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,21 +102,10 @@ func (c *Cluster) initClusterAndHTTPS(ctx context.Context) error {
 		return err
 	}
 
-	// Config the cluster database and allow it to add additional request handlers
-	handler, err = c.initClusterDB(ctx, handler)
+	// Register database request handlers and controller callbacks
+	handler, err = c.registerDBHandlers(handler)
 	if err != nil {
 		return err
-	}
-
-	if c.config.EnablePProf {
-		mux := mux.NewRouter().SkipClean(true)
-		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-		mux.PathPrefix("/debug/pprof/").HandlerFunc(pprof.Index)
-		mux.NotFoundHandler = handler
-		handler = mux
 	}
 
 	// Create a HTTP server with the registered request handlers, using logrus for logging
@@ -154,9 +141,13 @@ func (c *Cluster) initClusterAndHTTPS(ctx context.Context) error {
 func tlsStorage(ctx context.Context, dataDir string, runtime *config.ControlRuntime) dynamiclistener.TLSStorage {
 	fileStorage := file.New(filepath.Join(dataDir, "tls/dynamic-cert.json"))
 	cache := memory.NewBacked(fileStorage)
-	return kubernetes.New(ctx, func() *core.Factory {
-		return runtime.Core
-	}, metav1.NamespaceSystem, version.Program+"-serving", cache)
+	coreGetter := func() *core.Factory {
+		if coreFactory, ok := runtime.Core.(*core.Factory); ok {
+			return coreFactory
+		}
+		return nil
+	}
+	return kubernetes.New(ctx, coreGetter, metav1.NamespaceSystem, version.Program+"-serving", cache)
 }
 
 // wrapHandler wraps the dynamiclistener request handler, adding a User-Agent value to
