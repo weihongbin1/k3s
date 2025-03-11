@@ -1,12 +1,9 @@
 K3s - Lightweight Kubernetes
 ===============================================
-<<<<<<< HEAD
-aaa
 # a
 =======
 a
 # aaa
->>>>>>> 2bde33926c6542a7744dfadf82a75788b1ed6784
 Lightweight Kubernetes.  Production ready, easy to install, half the memory, all in a binary less than 100 MB.
 
 Great for:
